@@ -1,0 +1,153 @@
+name: Deploy API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'デプロイするイメージタグ（省略時は commit SHA）'
+        required: false
+
+env:
+  AWS_REGION: ap-northeast-1
+  TF_WORKING_DIR: terraform/environments/prod
+
+jobs:
+  # ─── CI: ビルド + テスト ──────────────────────────────────────────────────
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/character-api
+          path: api
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/character-db
+          path: db
+
+      - name: Start API + DB
+        working-directory: api-infra  # このリポジトリのルート
+        run: docker compose up -d --build
+
+      - name: Wait for healthcheck
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/healthz && break
+            sleep 2
+          done
+
+      - name: Run API tests
+        working-directory: api
+        run: go test ./...
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ─── Terraform plan（PR時） ────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -var-file=prod.tfvars -no-color
+        env:
+          TF_VAR_vpc_id: ${{ secrets.TF_VAR_VPC_ID }}
+          TF_VAR_public_subnet_ids: ${{ secrets.TF_VAR_PUBLIC_SUBNET_IDS }}
+          TF_VAR_private_subnet_ids: ${{ secrets.TF_VAR_PRIVATE_SUBNET_IDS }}
+          TF_VAR_db_secret_arn: ${{ secrets.TF_VAR_DB_SECRET_ARN }}
+          TF_VAR_rds_security_group_id: ${{ secrets.TF_VAR_RDS_SG_ID }}
+          TF_VAR_api_key_secret_arn: ${{ secrets.TF_VAR_API_KEY_SECRET_ARN }}
+
+  # ─── ビルド・push・デプロイ（main マージ後） ──────────────────────────────
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/character-api
+          path: api
+
+      - name: Set image tag
+        id: tag
+        run: |
+          TAG=${{ github.event.inputs.image_tag || github.sha }}
+          echo "tag=${TAG:0:7}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Docker image
+        working-directory: api
+        env:
+          IMAGE: ${{ vars.AWS_ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
+        run: |
+          docker build --target runtime -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy to ECS（ローリングアップデート）
+        run: |
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER }} \
+            --service ${{ vars.ECS_SERVICE }} \
+            --force-new-deployment
+
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER }} \
+            --services ${{ vars.ECS_SERVICE }}
+
+      - name: Terraform Apply（インフラ変更がある場合のみ）
+        uses: actions/checkout@v4
+        with:
+          path: api-infra
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init & Apply
+        working-directory: api-infra/${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init
+          terraform apply -var-file=prod.tfvars -var="image_tag=${{ steps.tag.outputs.tag }}" -auto-approve
+        env:
+          TF_VAR_vpc_id: ${{ secrets.TF_VAR_VPC_ID }}
+          TF_VAR_public_subnet_ids: ${{ secrets.TF_VAR_PUBLIC_SUBNET_IDS }}
+          TF_VAR_private_subnet_ids: ${{ secrets.TF_VAR_PRIVATE_SUBNET_IDS }}
+          TF_VAR_db_secret_arn: ${{ secrets.TF_VAR_DB_SECRET_ARN }}
+          TF_VAR_rds_security_group_id: ${{ secrets.TF_VAR_RDS_SG_ID }}
+          TF_VAR_api_key_secret_arn: ${{ secrets.TF_VAR_API_KEY_SECRET_ARN }}

@@ -1,0 +1,33 @@
+# ローカル・CI 用: API 単体起動
+#
+# 前提:
+#   1. character-db-infra/ で docker compose up -d を先に実行しておくこと
+#      (character-db-net ネットワークと DB が起動済みであること)
+#   2. 以下のレイアウトでリポジトリが配置されていること
+#      character-system/
+#      ├── apis/character-api-go/
+#      └── apis/character-api-go-infra/ (このファイル)
+#
+# 起動: docker compose up --build -d
+
+services:
+  character-api:
+    build:
+      context: ../character-api-go
+      dockerfile: Dockerfile
+      target: runtime
+    environment:
+      DB_DSN: "host=character-db user=${CHAR_DB_USER:-app} password=${CHAR_DB_PASSWORD:-devpassword} dbname=${CHAR_DB_NAME:-characters} port=5432 sslmode=disable TimeZone=UTC"
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-api-key}
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8080:8080"
+    networks:
+      - character-db-net
+
+networks:
+  character-db-net:
+    external: true
+    name: character-db-net
