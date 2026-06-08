@@ -15,9 +15,11 @@ env:
   TF_WORKING_DIR: terraform/environments/prod
 
 jobs:
-  # ─── CI: ビルド + テスト ──────────────────────────────────────────────────
+  # ─── CI: 静的解析 + ユニットテスト ────────────────────────────────────────
+  # API のテストは fake リポジトリで動く純粋なユニットテストなので、DB/compose は不要。
+  # （旧実装は存在しないパスを working-directory に指定しており動作しなかった）
   test:
-    name: Build & Test
+    name: Vet & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,29 +27,16 @@ jobs:
           repository: ${{ github.repository_owner }}/character-api
           path: api
 
-      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          repository: ${{ github.repository_owner }}/character-db
-          path: db
+          go-version: '1.23'
+          cache-dependency-path: api/go.sum
 
-      - name: Start API + DB
-        working-directory: api-infra  # このリポジトリのルート
-        run: docker compose up -d --build
-
-      - name: Wait for healthcheck
-        run: |
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8080/healthz && break
-            sleep 2
-          done
-
-      - name: Run API tests
+      - name: Vet & Test
         working-directory: api
-        run: go test ./...
-
-      - name: Tear down
-        if: always()
-        run: docker compose down -v
+        run: |
+          go vet ./...
+          go test ./...
 
   # ─── Terraform plan（PR時） ────────────────────────────────────────────
   terraform-plan:
