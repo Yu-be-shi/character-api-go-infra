@@ -61,21 +61,21 @@ jobs:
             echo "action=${{ inputs.action }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with: { path: api-infra }
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ github.repository_owner }}/character-db-infra
           path: db-infra
           ref: main
           token: ${{ secrets.GH_PAT }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ github.repository_owner }}/character-api-go
           path: api
           ref: main
           token: ${{ secrets.GH_PAT }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ github.repository_owner }}/character-db
           path: db
