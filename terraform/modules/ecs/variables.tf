@@ -96,6 +96,18 @@ variable "aws_region" {
   type = string
 }
 
+variable "ephemeral" {
+  description = "使い捨て環境か。true なら destroy 時にイメージごと ECR を削除できるようにする等。"
+  type        = bool
+  default     = false
+}
+
+variable "alarm_actions" {
+  description = "CloudWatch アラーム発報時の通知先 ARN（SNS 等）。空ならアラームは記録のみ。"
+  type        = list(string)
+  default     = []
+}
+
 variable "tags" {
   type    = map(string)
   default = {}
