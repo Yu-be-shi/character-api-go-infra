@@ -46,6 +46,21 @@ terraform apply -var-file=prod.tfvars
 - ECS タスクはプライベートサブネットに配置し、ALB 経由でのみ公開
 - DB 接続情報（DSN）は Secrets Manager から取得。タスク定義に平文で書かない
 - DB へのアクセスは ECS のセキュリティグループのみに限定（db-infra 側で制御）
+- `INTERNAL_API_KEY` も Secrets Manager から注入（`TF_VAR_API_KEY_SECRET_ARN`）。
+  application 側の `CHARACTER_API_KEY` と同値にすること（不一致だと API が 401）
+
+## 今後の改善（運用上の推奨）
+
+現状の構成に対する、優先度付きの改善候補。
+
+- **ALB を HTTPS 化（推奨・高）**：現在 ALB リスナーは HTTP のみ。本番では ACM 証明書を発行し
+  HTTPS(443) リスナー + HTTP→HTTPS リダイレクトを追加する。
+- **CORS オリジンを変数化（中）**：`modules/ecs` の `cors_origins` をハードコードせず
+  `variables.tf` / `prod.tfvars` から渡す。
+- **ECR タグの不変化（中）**：`image_tag_mutability` を `IMMUTABLE` にする（CI は既に commit SHA
+  タグで push しているため整合する）。`latest` の上書き事故を防ぐ。
+- **OpenAPI 型の自動生成を CI へ（低）**：application 側の `generate:types`（`openapi-typescript`）を
+  CI に組み込み、手書きの `Character` 型と API スキーマの乖離を防ぐ。
 
 ## 初回セットアップの順序
 
