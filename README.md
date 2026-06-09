@@ -56,22 +56,34 @@ terraform apply -var-file=prod.tfvars
 
 - **ローカル**：この compose に `character-api-redis`（redis:7-alpine）を同梱。API へ
   `REDIS_ADDR=character-api-redis:6379` を渡す。`REDIS_ADDR` 未設定なら冪等性機能は無効。
-- **本番（TODO）**：ElastiCache for Redis を Terraform で作成し、エンドポイントを ECS タスクの
-  `REDIS_ADDR` 環境変数に渡す（DB と同様、API の SG からのみ到達可能にする）。現状は
-  ローカル compose のみ実装済みで、ElastiCache モジュールは未作成。
+- **本番**：コスト最小化のため ElastiCache を使わず、**ECS タスクに Redis サイドカーコンテナ**を同梱
+  （`modules/ecs`）。awsvpc なので API は `localhost:6379` で到達。タスクと一緒に作られ・消える。
 
-## 今後の改善（運用上の推奨）
+## 本番スイッチ（AWS ephemeral / up・down）
 
-現状の構成に対する、優先度付きの改善候補。
+使う時だけ立てて普段は完全に消す「使い捨て本番」。`.github/workflows/prod-switch.yml` を手動実行
+（Actions → Run workflow）で **up=一気に構築 / down=全削除**。毎日深夜に自動 down（消し忘れ防止）。
 
-- **ALB を HTTPS 化（推奨・高）**：現在 ALB リスナーは HTTP のみ。本番では ACM 証明書を発行し
-  HTTPS(443) リスナー + HTTP→HTTPS リダイレクトを追加する。
-- **CORS オリジンを変数化（中）**：`modules/ecs` の `cors_origins` をハードコードせず
-  `variables.tf` / `prod.tfvars` から渡す。
-- **ECR タグの不変化（中）**：`image_tag_mutability` を `IMMUTABLE` にする（CI は既に commit SHA
-  タグで push しているため整合する）。`latest` の上書き事故を防ぐ。
-- **OpenAPI 型の自動生成を CI へ（低）**：application 側の `generate:types`（`openapi-typescript`）を
-  CI に組み込み、手書きの `Character` 型と API スキーマの乖離を防ぐ。
+- データは永続させない（`ephemeral=true` で RDS は削除保護無効・final snapshot 無し）。up のたびに
+  seeds で初期データを再投入。
+- up は循環依存（RDS↔API SG）を3段（DB→API→DB 再適用）で解消し、イメージ build/push と
+  マイグレーション・ECS 再デプロイまで実施。down は API→DB の順に destroy。
+- VPC/サブネット・`INTERNAL_API_KEY` の Secret は switch 外（恒久）。
+- **HTTPS は保留**（独自ドメイン未取得のため HTTP）。`modules/alb` は将来 ACM 証明書 ARN を変数で
+  受け取れば 443 リスナーを足せる構成にする余地を残す。
+
+## CI（このリポジトリ）
+
+- `deploy.yml` … `main` への通常デプロイ（ECS ローリング）。
+- `prod-switch.yml` … 上記の up/down スイッチ。
+- `deploy-stg.yml` … `develop` で**自宅 STG**（self-hosted runner）に compose デプロイ（後述）。
+- `security.yml` … gitleaks（秘密混入検査）。`dependabot.yml` で terraform/actions を定期更新。
+
+## STG（自宅サーバー）デプロイ
+
+`develop` への push で、自宅 WSL の **self-hosted runner（ラベル `character-stg`）** が
+`$STG_ROOT/apis/character-api-go-infra` を最新化し `docker compose up -d --build`。
+詳細・runner セットアップはメタリポジトリ README の「STG（自宅）」を参照。
 
 ## 初回セットアップの順序
 
@@ -85,6 +97,7 @@ terraform apply -var-file=prod.tfvars
 |---|---|---|
 | Secret | `AWS_ACCESS_KEY_ID` | AWS 認証情報 |
 | Secret | `AWS_SECRET_ACCESS_KEY` | AWS 認証情報 |
+| Secret | `GH_PAT` | prod-switch が他リポジトリ(db-infra/api/db)を checkout する PAT（repo 読み取り） |
 | Secret | `TF_VAR_VPC_ID` | VPC ID |
 | Secret | `TF_VAR_PUBLIC_SUBNET_IDS` | パブリックサブネット ID（JSON 配列形式） |
 | Secret | `TF_VAR_PRIVATE_SUBNET_IDS` | プライベートサブネット ID（JSON 配列形式） |

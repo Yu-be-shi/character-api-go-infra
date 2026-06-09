@@ -1,35 +1,30 @@
-name: Deploy API
+name: API Infra CI
 
+# 注意: 本番(AWS)への適用・デプロイは **このワークフローでは行わない**。
+# AWS は使い捨て(ephemeral)運用とし、構築/削除は prod-switch.yml の up/down だけが行う。
+# ここは PR 時の静的解析・テスト・terraform plan（差分提示）のみ。main への push では AWS を一切触らない。
 on:
-  push:
-    branches: [main]
   pull_request:
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: 'デプロイするイメージタグ（省略時は commit SHA）'
-        required: false
 
 env:
-  AWS_REGION: ap-northeast-1
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-northeast-1' }}
   TF_WORKING_DIR: terraform/environments/prod
 
 jobs:
-  # ─── CI: 静的解析 + ユニットテスト ────────────────────────────────────────
-  # API のテストは fake リポジトリで動く純粋なユニットテストなので、DB/compose は不要。
-  # （旧実装は存在しないパスを working-directory に指定しており動作しなかった）
+  # ─── CI: 静的解析 + ユニットテスト（API 本体コード）────────────────────────
   test:
     name: Vet & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/character-api
+          repository: ${{ github.repository_owner }}/character-api-go
           path: api
+          token: ${{ secrets.GH_PAT }}
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache-dependency-path: api/go.sum
 
       - name: Vet & Test
@@ -38,101 +33,25 @@ jobs:
           go vet ./...
           go test ./...
 
-  # ─── Terraform plan（PR時） ────────────────────────────────────────────
+  # ─── Terraform plan（PR に差分を提示するだけ。apply はしない）──────────────
   terraform-plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: hashicorp/setup-terraform@v3
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-
       - name: Terraform Init
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform init
-
       - name: Terraform Plan
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform plan -var-file=prod.tfvars -no-color
-        env:
-          TF_VAR_vpc_id: ${{ secrets.TF_VAR_VPC_ID }}
-          TF_VAR_public_subnet_ids: ${{ secrets.TF_VAR_PUBLIC_SUBNET_IDS }}
-          TF_VAR_private_subnet_ids: ${{ secrets.TF_VAR_PRIVATE_SUBNET_IDS }}
-          TF_VAR_db_secret_arn: ${{ secrets.TF_VAR_DB_SECRET_ARN }}
-          TF_VAR_rds_security_group_id: ${{ secrets.TF_VAR_RDS_SG_ID }}
-          TF_VAR_api_key_secret_arn: ${{ secrets.TF_VAR_API_KEY_SECRET_ARN }}
-
-  # ─── ビルド・push・デプロイ（main マージ後） ──────────────────────────────
-  deploy:
-    name: Build, Push & Deploy
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/character-api
-          path: api
-
-      - name: Set image tag
-        id: tag
-        run: |
-          TAG=${{ github.event.inputs.image_tag || github.sha }}
-          echo "tag=${TAG:0:7}" >> $GITHUB_OUTPUT
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build & Push Docker image
-        working-directory: api
-        env:
-          IMAGE: ${{ vars.AWS_ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
-        run: |
-          docker build --target runtime -t "$IMAGE" .
-          docker push "$IMAGE"
-
-      - name: Deploy to ECS（ローリングアップデート）
-        run: |
-          aws ecs update-service \
-            --cluster ${{ vars.ECS_CLUSTER }} \
-            --service ${{ vars.ECS_SERVICE }} \
-            --force-new-deployment
-
-          aws ecs wait services-stable \
-            --cluster ${{ vars.ECS_CLUSTER }} \
-            --services ${{ vars.ECS_SERVICE }}
-
-      - name: Terraform Apply（インフラ変更がある場合のみ）
-        uses: actions/checkout@v4
-        with:
-          path: api-infra
-
-      - uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init & Apply
-        working-directory: api-infra/${{ env.TF_WORKING_DIR }}
-        run: |
-          terraform init
-          terraform apply -var-file=prod.tfvars -var="image_tag=${{ steps.tag.outputs.tag }}" -auto-approve
+        run: terraform plan -no-color
         env:
           TF_VAR_vpc_id: ${{ secrets.TF_VAR_VPC_ID }}
           TF_VAR_public_subnet_ids: ${{ secrets.TF_VAR_PUBLIC_SUBNET_IDS }}

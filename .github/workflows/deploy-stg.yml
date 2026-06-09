@@ -1,0 +1,30 @@
+# STG（自宅サーバー）への API スタックデプロイ。
+# 前提は character-db-infra の deploy-stg.yml と同じ（self-hosted runner ラベル character-stg、
+# $STG_ROOT 配下に全リポジトリ clone 済み）。DB スタックが先に起動済みであること。
+name: Deploy STG (home)
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: stg-api
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, character-stg]
+    steps:
+      - name: Pull & up (Go API)
+        env:
+          STG_ROOT: ${{ vars.STG_ROOT }}
+        run: |
+          set -euo pipefail
+          ROOT="${STG_ROOT:-$HOME/character-system}"
+          # API 本体（ビルド元）と API インフラの両方を最新化。
+          git -C "$ROOT/apis/character-api-go" fetch origin develop && git -C "$ROOT/apis/character-api-go" reset --hard origin/develop
+          git -C "$ROOT/apis/character-api-go-infra" fetch origin develop && git -C "$ROOT/apis/character-api-go-infra" reset --hard origin/develop
+          cd "$ROOT/apis/character-api-go-infra"
+          # character-db-net / DB が起動済みである前提（DB スタックを先に up しておく）。
+          docker compose up -d --build

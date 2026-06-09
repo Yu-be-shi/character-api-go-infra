@@ -9,11 +9,14 @@ terraform {
 
 resource "aws_ecr_repository" "api" {
   name                 = var.ecr_name
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE" # 同一タグの上書きを禁止（CI は commit SHA タグで push）
 
   image_scanning_configuration {
     scan_on_push = true
   }
+
+  # ephemeral 構成では destroy 時にイメージごと削除できるようにする。
+  force_delete = var.ephemeral
 
   tags = var.tags
 }
@@ -100,44 +103,77 @@ resource "aws_ecs_task_definition" "api" {
   memory                   = var.memory
   execution_role_arn       = aws_iam_role.task_execution.arn
 
-  container_definitions = jsonencode([{
-    name  = var.service_name
-    image = "${aws_ecr_repository.api.repository_url}:${var.image_tag}"
+  container_definitions = jsonencode([
+    # 冪等性キー用 Redis（このタスク専有のサイドカー。awsvpc なので api からは localhost で到達）。
+    # ElastiCache を使わずコスト最小化。タスク再起動でキーは消えるが TTL 運用なので問題ない。
+    {
+      name      = "redis"
+      image     = "redis:7-alpine"
+      essential = false
+      command   = ["redis-server", "--save", "", "--appendonly", "no"]
+      healthCheck = {
+        command     = ["CMD", "redis-cli", "ping"]
+        interval    = 10
+        timeout     = 3
+        retries     = 5
+        startPeriod = 10
+      }
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.api.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "redis"
+        }
+      }
+    },
+    {
+      name      = var.service_name
+      image     = "${aws_ecr_repository.api.repository_url}:${var.image_tag}"
+      essential = true
 
-    portMappings = [{
-      containerPort = var.container_port
-      protocol      = "tcp"
-    }]
+      portMappings = [{
+        containerPort = var.container_port
+        protocol      = "tcp"
+      }]
 
-    environment = [
-      { name = "PORT", value = tostring(var.container_port) },
-      { name = "LOG_LEVEL", value = var.log_level },
-      { name = "CORS_ORIGINS", value = var.cors_origins },
-    ]
+      # redis が HEALTHY になってから api を起動（起動時の Ping を成功させる）。
+      dependsOn = [{
+        containerName = "redis"
+        condition     = "HEALTHY"
+      }]
 
-    # DB_DSN と INTERNAL_API_KEY は Secrets Manager から取得（平文を環境変数に書かない）
-    secrets = [
-      { name = "DB_DSN", valueFrom = "${var.db_secret_arn}:dsn::" },
-      { name = "INTERNAL_API_KEY", valueFrom = var.api_key_secret_arn },
-    ]
+      environment = [
+        { name = "PORT", value = tostring(var.container_port) },
+        { name = "LOG_LEVEL", value = var.log_level },
+        { name = "CORS_ORIGINS", value = var.cors_origins },
+        { name = "REDIS_ADDR", value = "localhost:6379" },
+      ]
 
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.api.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "ecs"
+      # DB_DSN と INTERNAL_API_KEY は Secrets Manager から取得（平文を環境変数に書かない）
+      secrets = [
+        { name = "DB_DSN", valueFrom = "${var.db_secret_arn}:dsn::" },
+        { name = "INTERNAL_API_KEY", valueFrom = var.api_key_secret_arn },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.api.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
+
+      healthCheck = {
+        command     = ["CMD-SHELL", "wget -qO- http://localhost:${var.container_port}/healthz || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
       }
     }
-
-    healthCheck = {
-      command     = ["CMD-SHELL", "wget -qO- http://localhost:${var.container_port}/healthz || exit 1"]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 60
-    }
-  }])
+  ])
 }
 
 resource "aws_ecs_service" "api" {
@@ -162,4 +198,45 @@ resource "aws_ecs_service" "api" {
   depends_on = [var.alb_listener_arn]
 
   tags = var.tags
+}
+
+# ── 可観測性（CloudWatch アラーム）─────────────────────────────────────────────
+# alarm_actions が空なら通知はされず記録のみ（コスト最小）。SNS 等を渡せば通知される。
+
+resource "aws_cloudwatch_metric_alarm" "ecs_cpu_high" {
+  alarm_name          = "${var.service_name}-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ECS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "ECS サービスの CPU 使用率が高い"
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.api.name
+  }
+  alarm_actions = var.alarm_actions
+  ok_actions    = var.alarm_actions
+  tags          = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "ecs_no_running_tasks" {
+  alarm_name          = "${var.service_name}-no-running-tasks"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "RunningTaskCount"
+  namespace           = "ECS/ContainerInsights"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 1
+  alarm_description   = "稼働中の ECS タスクが無い（サービス停止）"
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.api.name
+  }
+  alarm_actions      = var.alarm_actions
+  treat_missing_data = "breaching"
+  tags               = var.tags
 }
