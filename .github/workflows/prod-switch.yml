@@ -168,6 +168,21 @@ jobs:
           aws ecs update-service --cluster "${{ vars.ECS_CLUSTER }}" --service "${{ vars.ECS_SERVICE }}" --force-new-deployment
           aws ecs wait services-stable --cluster "${{ vars.ECS_CLUSTER }}" --services "${{ vars.ECS_SERVICE }}"
 
+      - name: UP - 6) smoke test (ALB /healthz が 200 を返すまで待つ)
+        if: steps.act.outputs.action == 'up'
+        working-directory: ${{ env.API_TF }}
+        run: |
+          set -euo pipefail
+          EP="$(terraform output -raw api_endpoint)"
+          echo "endpoint: $EP"
+          for i in $(seq 1 20); do
+            code=$(curl -fsS -o /dev/null -w '%{http_code}' "$EP/healthz" || true)
+            if [ "$code" = "200" ]; then echo "healthz OK"; exit 0; fi
+            echo "waiting healthz ($i/20): got '$code'"; sleep 10
+          done
+          echo "smoke test failed: /healthz が 200 を返しませんでした" >&2
+          exit 1
+
       - name: UP - summary
         if: steps.act.outputs.action == 'up'
         working-directory: ${{ env.API_TF }}
