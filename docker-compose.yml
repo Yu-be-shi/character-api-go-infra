@@ -22,8 +22,26 @@ services:
       PORT: "8080"
       LOG_LEVEL: ${LOG_LEVEL:-info}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # 冪等性キー用 Redis（このサービス専有）。未設定なら冪等性機能は無効。
+      REDIS_ADDR: ${REDIS_ADDR:-character-api-redis:6379}
     ports:
       - "8080:8080"
+    depends_on:
+      character-api-redis:
+        condition: service_healthy
+    networks:
+      - character-db-net
+
+  # character-api 専有の Redis（冪等キーの重複排除ストア）。
+  # 共有 DB(character-db) とは別物で、このサービスだけが使う private ストア。
+  character-api-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks:
       - character-db-net
 

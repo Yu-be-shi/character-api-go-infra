@@ -49,6 +49,17 @@ terraform apply -var-file=prod.tfvars
 - `INTERNAL_API_KEY` も Secrets Manager から注入（`TF_VAR_API_KEY_SECRET_ARN`）。
   application 側の `CHARACTER_API_KEY` と同値にすること（不一致だと API が 401）
 
+## 冪等性キー用 Redis（character-api 専有）
+
+`POST /characters` の二重送信を重複排除するため、character-api は Redis を使う。これは
+**character-api だけが使う private なストア**で、共有スキーマの `character-db` とは別物（Database per Service）。
+
+- **ローカル**：この compose に `character-api-redis`（redis:7-alpine）を同梱。API へ
+  `REDIS_ADDR=character-api-redis:6379` を渡す。`REDIS_ADDR` 未設定なら冪等性機能は無効。
+- **本番（TODO）**：ElastiCache for Redis を Terraform で作成し、エンドポイントを ECS タスクの
+  `REDIS_ADDR` 環境変数に渡す（DB と同様、API の SG からのみ到達可能にする）。現状は
+  ローカル compose のみ実装済みで、ElastiCache モジュールは未作成。
+
 ## 今後の改善（運用上の推奨）
 
 現状の構成に対する、優先度付きの改善候補。
