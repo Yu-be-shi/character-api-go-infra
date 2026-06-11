@@ -10,12 +10,8 @@ resource "aws_security_group" "alb" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # 443 はリスナーを作るまで開けない（HTTPS はドメイン取得後に ACM 変数で有効化する想定。
+  # リスナーの無いポートの開放は不要な攻撃面になるだけ）。
 
   egress {
     from_port   = 0
@@ -42,6 +38,9 @@ resource "aws_lb_target_group" "api" {
   protocol    = "HTTP"
   vpc_id      = var.vpc_id
   target_type = "ip"
+
+  # 既定 300 秒の drain は ephemeral（毎晩 destroy）には長すぎ、down を無駄に遅くする。
+  deregistration_delay = 15
 
   health_check {
     path                = "/healthz"

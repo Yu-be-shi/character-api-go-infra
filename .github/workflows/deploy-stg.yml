@@ -6,6 +6,11 @@ name: Deploy STG (home)
 on:
   push:
     branches: [develop]
+  # API 本体（character-api-go）の develop 更新通知でも再デプロイする
+  # （これが無いと API のコード変更が STG に反映されない。送信側は
+  #  character-api-go の notify-stg.yml）。
+  repository_dispatch:
+    types: [character-api-updated]
   workflow_dispatch:
 
 concurrency:

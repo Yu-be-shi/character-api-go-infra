@@ -6,40 +6,57 @@ API サーバーのプロビジョニング・デプロイ・セキュリティ�
 ## 責務
 
 - AWS ECS Fargate + ALB + ECR のプロビジョニング（Terraform）
-- Docker イメージのビルド・push・ECS デプロイ CI（GitHub Actions）
-- ローカル・CI 用の API + DB 起動（Docker Compose）
+- Docker イメージのビルド・push・本番スイッチ CI（GitHub Actions）
+- ローカル・CI 用の API + Redis 起動（Docker Compose。**DB は含まない**:
+  先に character-db-infra のスタックを起動し `character-db-net` 経由で到達する）
 
 ## リポジトリレイアウト前提
 
+各 docker-compose / CI は、メタリポジトリ `character-system/` 配下に sibling として
+clone されていることを前提にする（compose の build context は `../character-api-go`）:
+
 ```
-workspace/
-├── db/         # character-db
-├── api/        # character-api
-└── api-infra/  # このリポジトリ
+character-system/
+├── character-db/
+├── character-db-infra/
+├── apis/
+│   ├── character-api-go/        # API 本体
+│   └── character-api-go-infra/  # このリポジトリ
+└── applications/character-application-nextjs/
 ```
 
 ## 環境別の使い方
 
-### ローカル / CI（API + DB 起動）
+### ローカル / CI（API + Redis 起動。character-db-infra が先に起動済みであること）
 
 ```bash
-docker compose up
+cp .env.example .env   # INTERNAL_API_KEY 等（application 側と同値にする）
+docker compose up --build -d
 ```
+
+デバッグ用のホスト公開（8080）は**ループバック限定**（LAN/外部に晒さない）。
 
 ### 本番（Terraform）
 
+S3 backend は **bucket を持たない部分設定**。init 時に必ず注入する
+（state バケットと DynamoDB ロックテーブル `terraform-state-lock` は事前作成）:
+
 ```bash
 cd terraform/environments/prod
+terraform init -backend-config="bucket=<state バケット名>"
 
-terraform init
-cp prod.tfvars.example prod.tfvars  # 値を編集する
-
-terraform plan  -var-file=prod.tfvars
-terraform apply -var-file=prod.tfvars
+# 変数は TF_VAR_* で渡す（CI と同じ方式。prod.tfvars はコミットしない）
+export TF_VAR_vpc_id=... TF_VAR_public_subnet_ids='[...]' TF_VAR_private_subnet_ids='[...]'
+export TF_VAR_db_secret_arn=... TF_VAR_rds_security_group_id=... TF_VAR_api_key_secret_arn=...
+terraform plan
+terraform apply
 ```
 
-`prod.tfvars` に設定する値のうち、`db_secret_arn` と `rds_security_group_id` は
-**db-infra の `terraform output`** から取得する。
+`db_secret_arn` と `rds_security_group_id` は **db-infra の `terraform output`** から取得する。
+
+> **ネットワーク前提**: ECS タスクはプライベートサブネット（public IP なし）で動くため、
+> ECR / Secrets Manager / CloudWatch Logs への到達経路（NAT Gateway もしくは VPC
+> エンドポイント）が既存 VPC 側に必要。
 
 ## セキュリティ境界
 
@@ -74,8 +91,10 @@ terraform apply -var-file=prod.tfvars
 
 ## CI（このリポジトリ）
 
-- `deploy.yml` … `main` への通常デプロイ（ECS ローリング）。
-- `prod-switch.yml` … 上記の up/down スイッチ。
+- `deploy.yml` … **PR 時の検証のみ**（Go の vet/test + Terraform plan）。AWS への適用はしない。
+  本番への適用は `prod-switch.yml` だけが行う。
+- `prod-switch.yml` … 上記の up/down スイッチ。イメージタグはこの infra リポジトリではなく
+  **ビルド対象ソース（character-api-go / character-db の main）の commit SHA** を使う。
 - `deploy-stg.yml` … `develop` で**自宅 STG**（self-hosted runner）に compose デプロイ（後述）。
 - `security.yml` … gitleaks（秘密混入検査）。`dependabot.yml` で terraform/actions を定期更新。
 
@@ -95,15 +114,20 @@ terraform apply -var-file=prod.tfvars
 
 | 種別 | 名前 | 説明 |
 |---|---|---|
-| Secret | `AWS_ACCESS_KEY_ID` | AWS 認証情報 |
-| Secret | `AWS_SECRET_ACCESS_KEY` | AWS 認証情報 |
+| Secret | `AWS_ROLE_ARN` | OIDC で Assume する IAM ロール（長期アクセスキーは使わない） |
 | Secret | `GH_PAT` | prod-switch が他リポジトリ(db-infra/api/db)を checkout する PAT（repo 読み取り） |
 | Secret | `TF_VAR_VPC_ID` | VPC ID |
 | Secret | `TF_VAR_PUBLIC_SUBNET_IDS` | パブリックサブネット ID（JSON 配列形式） |
 | Secret | `TF_VAR_PRIVATE_SUBNET_IDS` | プライベートサブネット ID（JSON 配列形式） |
-| Secret | `TF_VAR_DB_SECRET_ARN` | db-infra output: db_secret_arn |
-| Secret | `TF_VAR_RDS_SG_ID` | db-infra output: rds_security_group_id |
+| Secret | `TF_VAR_DB_SECRET_ARN` | db-infra output: db_secret_arn（deploy.yml の plan 用。ephemeral では up のたびに変わるため plan 差分のノイズになる点に注意） |
+| Secret | `TF_VAR_RDS_SG_ID` | db-infra output: rds_security_group_id（同上） |
 | Secret | `TF_VAR_API_KEY_SECRET_ARN` | INTERNAL_API_KEY の Secrets Manager ARN |
-| Variable | `AWS_ECR_REPOSITORY` | terraform output: ecr_repository_url |
+| Variable | `TF_STATE_BUCKET` | S3 backend のバケット名（`terraform init -backend-config`） |
+| Variable | `AWS_ECR_REPOSITORY` | **ECR リポジトリ名**（例: `character-api`。URL ではない） |
 | Variable | `ECS_CLUSTER` | terraform output: ecs_cluster_name |
 | Variable | `ECS_SERVICE` | terraform output: ecs_service_name |
+| Variable | `STG_ROOT` | STG 自宅サーバーのメタリポジトリ配置先（既定 `~/character-system`） |
+| Variable | `CORS_ORIGINS` | 任意。本番 API の許可オリジン |
+
+environment は2つ使う: `production`（手動 up/down。保護を付けてよい）と
+`production-auto`（夜間自動 down。**保護を付けない**こと。付けると承認待ちで自動 down が止まる）。
