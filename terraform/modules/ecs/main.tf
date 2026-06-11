@@ -23,6 +23,15 @@ resource "aws_ecr_repository" "api" {
 
 resource "aws_ecs_cluster" "main" {
   name = var.cluster_name
+
+  # ECS/ContainerInsights 名前空間のメトリクス（RunningTaskCount 等）は
+  # これを有効にしないと出力されず、下の no-running-tasks アラームが
+  # 常時 ALARM（missing data）になる。ephemeral 運用なのでコスト影響は小さい。
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
   tags = var.tags
 }
 
@@ -165,13 +174,10 @@ resource "aws_ecs_task_definition" "api" {
         }
       }
 
-      healthCheck = {
-        command     = ["CMD-SHELL", "wget -qO- http://localhost:${var.container_port}/healthz || exit 1"]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
-      }
+      # コンテナレベルの healthCheck は定義しない:
+      # runtime イメージは distroless（シェルも wget も無い）のため CMD-SHELL の
+      # チェックは常に失敗し、タスクが kill ループに陥る。ヘルスチェックは
+      # ALB ターゲットグループの /healthz に一本化する。
     }
   ])
 }
@@ -193,6 +199,13 @@ resource "aws_ecs_service" "api" {
     target_group_arn = var.target_group_arn
     container_name   = var.service_name
     container_port   = var.container_port
+  }
+
+  # 失敗デプロイを自動検知してロールバックする（services-stable 待ちでの
+  # ハングを防ぐ）。
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
   }
 
   depends_on = [var.alb_listener_arn]

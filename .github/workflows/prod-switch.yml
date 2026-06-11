@@ -46,6 +46,10 @@ env:
   TF_VAR_api_key_secret_arn: ${{ secrets.TF_VAR_API_KEY_SECRET_ARN }}
   TF_VAR_cors_origins: ${{ vars.CORS_ORIGINS || '*' }}
   TF_VAR_ephemeral: "true"
+  # API / migrate 両方のタスク定義が参照するイメージタグ。push するタグ
+  # （commit SHA）と必ず一致させる（db-infra 側の migrate タスク定義も
+  # この変数を使う。既定の latest は CI では push されない）。
+  TF_VAR_image_tag: ${{ github.sha }}
 
 jobs:
   switch:
@@ -129,12 +133,27 @@ jobs:
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com"
           REG="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com"
+
+          # API リポジトリは IMMUTABLE のため、同一コミットでの再 up（リトライ等）では
+          # 既存タグへの push が ImageTagAlreadyExists で失敗する。存在すればスキップする。
+          tag_exists() {
+            aws ecr describe-images --repository-name "$1" --image-ids imageTag="$2" >/dev/null 2>&1
+          }
+
           # API イメージ（commit SHA タグ＝ECS タスク定義の image_tag と一致させる）
-          docker build --target runtime -t "$REG/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}" api/
-          docker push "$REG/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}"
-          # マイグレーションイメージ
-          docker build -f db/Dockerfile.migrate -t "$REG/character-db-migrate:${{ github.sha }}" db/
-          docker push "$REG/character-db-migrate:${{ github.sha }}"
+          if tag_exists "${{ vars.AWS_ECR_REPOSITORY }}" "${{ github.sha }}"; then
+            echo "api image ${{ github.sha }} already pushed; skipping"
+          else
+            docker build --target runtime -t "$REG/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}" api/
+            docker push "$REG/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}"
+          fi
+          # マイグレーションイメージ（タスク定義の TF_VAR_image_tag と一致させる）
+          if tag_exists "character-db-migrate" "${{ github.sha }}"; then
+            echo "migrate image ${{ github.sha }} already pushed; skipping"
+          else
+            docker build -f db/Dockerfile.migrate -t "$REG/character-db-migrate:${{ github.sha }}" db/
+            docker push "$REG/character-db-migrate:${{ github.sha }}"
+          fi
 
       - name: UP - 3) DB re-apply (allow API SG)
         if: steps.act.outputs.action == 'up'
