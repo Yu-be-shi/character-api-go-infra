@@ -87,7 +87,7 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
 
       # ───────────────────────── UP（構築）─────────────────────────
       # 循環依存（RDS は API の SG を許可 / API は RDS の secret を必要）を3段で解す:
