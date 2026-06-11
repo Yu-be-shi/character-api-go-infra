@@ -3,9 +3,12 @@
 # $STG_ROOT 配下に全リポジトリ clone 済み）。DB スタックが先に起動済みであること。
 name: Deploy STG (home)
 
+# STG は `staging` ブランチの鏡。develop マージでは STG を触らない。API 本体
+# （character-api-go）と本リポジトリの staging を反映する。staging へ promote するか
+# 手動（workflow_dispatch）でデプロイ。
 on:
   push:
-    branches: [develop]
+    branches: [staging]
   workflow_dispatch:
 
 concurrency:
@@ -22,9 +25,9 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="${STG_ROOT:-$HOME/character-system}"
-          # API 本体（ビルド元）と API インフラの両方を最新化。
-          git -C "$ROOT/apis/character-api-go" fetch origin develop && git -C "$ROOT/apis/character-api-go" reset --hard origin/develop
-          git -C "$ROOT/apis/character-api-go-infra" fetch origin develop && git -C "$ROOT/apis/character-api-go-infra" reset --hard origin/develop
+          # API 本体（ビルド元）と API インフラの両方を staging に最新化。
+          git -C "$ROOT/apis/character-api-go" fetch origin staging && git -C "$ROOT/apis/character-api-go" reset --hard origin/staging
+          git -C "$ROOT/apis/character-api-go-infra" fetch origin staging && git -C "$ROOT/apis/character-api-go-infra" reset --hard origin/staging
           cd "$ROOT/apis/character-api-go-infra"
           # character-db-net / DB が起動済みである前提（DB スタックを先に up しておく）。
           docker compose up -d --build
