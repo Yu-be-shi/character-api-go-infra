@@ -16,7 +16,7 @@ jobs:
     name: Vet & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ github.repository_owner }}/character-api-go
           path: api
@@ -38,7 +38,7 @@ jobs:
     name: Terraform Plan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
