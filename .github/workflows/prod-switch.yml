@@ -6,14 +6,22 @@
 #   up のたびに seeds で初期データ（races 等）が再投入される。
 #
 # 必要な Secrets / Variables（リポジトリ設定）:
-#   secrets.AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  … AWS 認証
+#   secrets.AWS_ROLE_ARN                               … OIDC で Assume する IAM ロール（長期キーは使わない）
 #   secrets.GH_PAT                                     … 他リポジトリ(db-infra/api/db) を checkout する PAT(repo 読み取り)
 #   secrets.TF_VAR_VPC_ID                              … 既存 VPC（switch では作らない・残す）
 #   secrets.TF_VAR_PUBLIC_SUBNET_IDS  (JSON 配列)      … ALB 用
 #   secrets.TF_VAR_PRIVATE_SUBNET_IDS (JSON 配列)      … ECS/RDS 用
 #   secrets.TF_VAR_API_KEY_SECRET_ARN                  … INTERNAL_API_KEY の Secrets Manager ARN（永続・switch外で作成）
-#   vars.AWS_REGION (任意, 既定 ap-northeast-1) / vars.ECS_CLUSTER / vars.ECS_SERVICE / vars.AWS_ECR_REPOSITORY
+#   vars.AWS_REGION (任意, 既定 ap-northeast-1) / vars.ECS_CLUSTER / vars.ECS_SERVICE
+#   vars.AWS_ECR_REPOSITORY … ECR リポジトリ「名」（例: character-api。URL ではない）
+#   vars.TF_STATE_BUCKET    … S3 backend のバケット名（backend.tf は部分設定のため必須）
 #   vars.CORS_ORIGINS (任意)
+#
+# 運用メモ:
+#   - 夜間 down（schedule）は environment 保護（必須レビュアー等）で止まらないよう
+#     別 environment（production-auto。保護を付けないこと）で実行する。
+#   - GitHub はリポジトリが 60 日間非アクティブだと scheduled workflow を自動無効化する。
+#     消し忘れ防止の最後の砦なので、無効化通知が来たら必ず再有効化すること。
 name: Prod Switch (AWS ephemeral)
 
 on:
@@ -30,6 +38,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write # OIDC
 
 concurrency:
   group: prod-switch
@@ -46,15 +55,16 @@ env:
   TF_VAR_api_key_secret_arn: ${{ secrets.TF_VAR_API_KEY_SECRET_ARN }}
   TF_VAR_cors_origins: ${{ vars.CORS_ORIGINS || '*' }}
   TF_VAR_ephemeral: "true"
-  # API / migrate 両方のタスク定義が参照するイメージタグ。push するタグ
-  # （commit SHA）と必ず一致させる（db-infra 側の migrate タスク定義も
-  # この変数を使う。既定の latest は CI では push されない）。
-  TF_VAR_image_tag: ${{ github.sha }}
+  # イメージタグはこの infra リポジトリの SHA ではなく「ビルド対象ソース」の SHA を使う
+  # （steps.shas）。infra の SHA だと、api/db リポジトリだけが進んだ再 up で
+  # 既存タグ＝古いイメージのまま成功扱いになってしまう。
 
 jobs:
   switch:
     runs-on: ubuntu-latest
-    environment: production
+    # 手動 up/down は保護付き environment、夜間 down は保護なしの production-auto で実行
+    # （必須レビュアー等を production に設定しても自動 down が承認待ちで止まらない）。
+    environment: ${{ github.event_name == 'schedule' && 'production-auto' || 'production' }}
     steps:
       - name: Resolve action（schedule は常に down）
         id: act
@@ -88,10 +98,16 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - uses: hashicorp/setup-terraform@v3
+
+      # ビルド対象ソース（main）の SHA。タスク定義のイメージタグと push タグを一致させる。
+      - name: Resolve source SHAs
+        id: shas
+        run: |
+          echo "api=$(git -C api rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "db=$(git -C db rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # ───────────────────────── UP（構築）─────────────────────────
       # 循環依存（RDS は API の SG を許可 / API は RDS の secret を必要）を3段で解す:
@@ -103,8 +119,9 @@ jobs:
         working-directory: ${{ env.DB_TF }}
         env:
           TF_VAR_api_security_group_ids: "[]"
+          TF_VAR_image_tag: ${{ steps.shas.outputs.db }}
         run: |
-          terraform init
+          terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
           terraform apply -auto-approve
 
       - name: UP - capture DB outputs
@@ -121,9 +138,9 @@ jobs:
         env:
           TF_VAR_db_secret_arn: ${{ steps.dbout.outputs.db_secret_arn }}
           TF_VAR_rds_security_group_id: ${{ steps.dbout.outputs.rds_sg }}
-          TF_VAR_image_tag: ${{ github.sha }}
+          TF_VAR_image_tag: ${{ steps.shas.outputs.api }}
         run: |
-          terraform init
+          terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
           terraform apply -auto-approve
 
       - name: UP - build & push images (api + migrate)
@@ -140,24 +157,29 @@ jobs:
             aws ecr describe-images --repository-name "$1" --image-ids imageTag="$2" >/dev/null 2>&1
           }
 
-          # API イメージ（commit SHA タグ＝ECS タスク定義の image_tag と一致させる）
-          if tag_exists "${{ vars.AWS_ECR_REPOSITORY }}" "${{ github.sha }}"; then
-            echo "api image ${{ github.sha }} already pushed; skipping"
+          # タグは「ビルド対象ソース」の SHA（タスク定義の image_tag と一致）。
+          # IMMUTABLE のため同一ソースの再 up は push をスキップする（同一 SHA = 同一内容
+          # なのでスキップしても古いイメージにはならない）。
+          API_SHA="${{ steps.shas.outputs.api }}"
+          DB_SHA="${{ steps.shas.outputs.db }}"
+          if tag_exists "${{ vars.AWS_ECR_REPOSITORY }}" "$API_SHA"; then
+            echo "api image $API_SHA already pushed; skipping"
           else
-            docker build --target runtime -t "$REG/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}" api/
-            docker push "$REG/${{ vars.AWS_ECR_REPOSITORY }}:${{ github.sha }}"
+            docker build --target runtime -t "$REG/${{ vars.AWS_ECR_REPOSITORY }}:$API_SHA" api/
+            docker push "$REG/${{ vars.AWS_ECR_REPOSITORY }}:$API_SHA"
           fi
-          # マイグレーションイメージ（タスク定義の TF_VAR_image_tag と一致させる）
-          if tag_exists "character-db-migrate" "${{ github.sha }}"; then
-            echo "migrate image ${{ github.sha }} already pushed; skipping"
+          if tag_exists "character-db-migrate" "$DB_SHA"; then
+            echo "migrate image $DB_SHA already pushed; skipping"
           else
-            docker build -f db/Dockerfile.migrate -t "$REG/character-db-migrate:${{ github.sha }}" db/
-            docker push "$REG/character-db-migrate:${{ github.sha }}"
+            docker build -f db/Dockerfile.migrate -t "$REG/character-db-migrate:$DB_SHA" db/
+            docker push "$REG/character-db-migrate:$DB_SHA"
           fi
 
       - name: UP - 3) DB re-apply (allow API SG)
         if: steps.act.outputs.action == 'up'
         working-directory: ${{ env.DB_TF }}
+        env:
+          TF_VAR_image_tag: ${{ steps.shas.outputs.db }}
         run: |
           # API の ECS SG を取得して RDS に許可する（循環依存の解消）。
           API_SG="$(terraform -chdir=../../../../api-infra/terraform/environments/prod output -raw ecs_security_group_id)"
@@ -209,6 +231,27 @@ jobs:
 
       # ───────────────────────── DOWN（全削除）─────────────────────────
       # 依存の逆順で destroy（API → DB）。VPC/サブネット/API キー Secret は switch 外なので残る。
+      #
+      # 0) 先に DB 側の「API SG を参照する ingress ルール」を剥がす。
+      #    AWS は他 SG のルールから参照されている SG を削除できない（DependencyViolation）
+      #    ため、これをやらないと API destroy が ECS SG の削除でタイムアウトする。
+      #    state が空（既に down 済み）のときに apply すると環境を「作って」しまうので、
+      #    リソースが存在するときだけ実行する。
+      - name: DOWN - 0) DB detach API SG reference
+        if: steps.act.outputs.action == 'down'
+        working-directory: ${{ env.DB_TF }}
+        env:
+          TF_VAR_api_security_group_ids: "[]"
+          TF_VAR_image_tag: ${{ steps.shas.outputs.db }}
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          if [ -n "$(terraform state list 2>/dev/null)" ]; then
+            terraform apply -auto-approve
+          else
+            echo "DB state is empty (already down); skip detach"
+          fi
+
       - name: DOWN - destroy API
         if: steps.act.outputs.action == 'down'
         working-directory: ${{ env.API_TF }}
@@ -216,7 +259,7 @@ jobs:
           TF_VAR_db_secret_arn: "arn:aws:secretsmanager:dummy"
           TF_VAR_rds_security_group_id: "sg-dummy"
         run: |
-          terraform init
+          terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
           terraform destroy -auto-approve
 
       - name: DOWN - destroy DB
@@ -225,5 +268,5 @@ jobs:
         env:
           TF_VAR_api_security_group_ids: "[]"
         run: |
-          terraform init
+          terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
           terraform destroy -auto-approve
